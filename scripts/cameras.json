@@ -1,0 +1,5 @@
+[
+  { "name": "front-door", "platform": "t31", "ip": "192.168.1.221" },
+  { "name": "back-yard",  "platform": "t31", "ip": "192.168.1.222" },
+  { "name": "garage",     "platform": "t20", "ip": "192.168.1.223" }
+]

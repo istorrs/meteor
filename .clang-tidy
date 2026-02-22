@@ -1,0 +1,15 @@
+---
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  security-*,
+  -cert-dcl37-c,
+  -cert-dcl51-c,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+
+# DeprecatedOrUnsafeBufferHandling is disabled because it recommends C11
+# Annex K functions (memset_s, fprintf_s, etc.) which are not implemented
+# in musl libc (our target platform).
+
+HeaderFilterRegex: 'include/meteor/.*'

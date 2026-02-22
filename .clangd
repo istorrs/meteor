@@ -1,0 +1,6 @@
+CompileFlags:
+  # Replace cross-compiler with clang for analysis
+  Compiler: clang
+  Remove:
+    - --sysroot=*
+    - -march=*
