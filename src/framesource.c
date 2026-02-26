@@ -84,3 +84,44 @@ int meteor_framesource_exit(int chn)
 	METEOR_LOG_INFO("framesource ch%d destroyed", chn);
 	return 0;
 }
+
+int meteor_framesource_set_depth(int chn, int depth)
+{
+	int ret;
+
+	ret = IMP_FrameSource_SetFrameDepth(chn, depth);
+	if (ret) {
+		METEOR_LOG_ERR("IMP_FrameSource_SetFrameDepth(%d, %d) failed: %d",
+			       chn, depth, ret);
+		return ret;
+	}
+
+	METEOR_LOG_DBG("framesource ch%d frame depth set to %d", chn, depth);
+	return 0;
+}
+
+int meteor_framesource_get_frame(int chn, IMPFrameInfo **frame)
+{
+	int ret;
+
+	ret = IMP_FrameSource_GetFrame(chn, frame);
+	if (ret) {
+		METEOR_LOG_ERR("IMP_FrameSource_GetFrame(%d) failed: %d", chn, ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+int meteor_framesource_release_frame(int chn, IMPFrameInfo *frame)
+{
+	int ret;
+
+	ret = IMP_FrameSource_ReleaseFrame(chn, frame);
+	if (ret) {
+		METEOR_LOG_ERR("IMP_FrameSource_ReleaseFrame(%d) failed: %d", chn, ret);
+		return ret;
+	}
+
+	return 0;
+}

@@ -216,8 +216,10 @@ libimp  libalog  libsysutils  libmuslshim  libpthread  libm  librt
 ### Build Output
 
 ```
-build-t31/meteor    # T31 binary, 32-bit MIPS ELF, dynamically linked
-build-t20/meteor    # T20 binary, 32-bit MIPS ELF, dynamically linked
+build-t31/meteor       # T31 meteor detector binary
+build-t31/astrostack   # T31 astrophotography stacker binary
+build-t20/meteor       # T20 meteor detector binary
+build-t20/astrostack   # T20 astrophotography stacker binary
 ```
 
 Verify with:
@@ -257,15 +259,37 @@ The required shared libraries must be present on the camera in `/usr/lib/`:
 ```
 
 These are part of the thingino rootfs and should already be in place on a flashed
-camera. Run the binary:
+camera. Also copy the wrapper script:
+
+```bash
+scp scripts/nightsky.sh root@<camera-ip>:/tmp/
+```
+
+### Running
+
+Both `meteor` and `astrostack` should be run via the `nightsky.sh` wrapper, which
+prepares the camera hardware for night sky use:
 
 ```bash
 ssh root@<camera-ip>
-/tmp/meteor
+
+# Meteor detection
+/tmp/nightsky.sh /tmp/meteor
+
+# Astrophotography stacking (30 frames, 5s exposures, outlier rejection)
+/tmp/nightsky.sh /tmp/astrostack -n 30 -e 5 -c -o /tmp/stack.ppm
 ```
 
-Stop with `Ctrl+C` (SIGINT) or `kill` (SIGTERM) — meteor handles both for graceful
-teardown.
+The wrapper script:
+1. Stops the `daynightd` daemon (prevents IR/filter state changes)
+2. Turns off IR illumination LEDs (eliminates glare)
+3. Removes the IR cut filter (allows full spectrum sensitivity)
+4. Turns off status LEDs (prevents light leaks and reflections)
+5. Runs the application
+6. Restores previous hardware state on exit
+
+Stop with `Ctrl+C` (SIGINT) or `kill` (SIGTERM) — both applications handle graceful
+teardown, and the wrapper restores hardware state via its exit trap.
 
 ## Project Structure
 
@@ -280,20 +304,24 @@ meteor/
 ├── include/meteor/
 │   ├── system.h                # IMP system init/exit/bind wrappers
 │   ├── isp.h                   # ISP lifecycle (sensor, tuning)
+│   ├── isp_tuning.h            # ISP tuning for meteor detection
 │   ├── framesource.h           # FrameSource channel management
 │   ├── ivs.h                   # IVS motion detection
 │   └── log.h                   # Logging macros
 ├── scripts/
 │   ├── cameras.json            # Camera inventory (name, platform, IP)
 │   ├── deploy_binaries.sh      # Quick binary deploy via SCP
-│   └── deploy_firmware.sh      # Full firmware rebuild + sysupgrade
+│   ├── deploy_firmware.sh      # Full firmware rebuild + sysupgrade
+│   └── nightsky.sh             # Hardware setup wrapper (IR, LEDs, daemon)
 └── src/
     ├── main.c                  # Entry point, pipeline setup, signal handling
     ├── system.c                # IMP_System_Init/Exit/Bind/UnBind
     ├── isp.c                   # Sensor config (GC2053/JXF22), ISP open/close
+    ├── isp_tuning.c            # Denoise, gain, DRC, exposure tuning
     ├── framesource.c           # NV12 channel create/enable/disable
     ├── ivs.c                   # Motion detection setup and poll loop
-    └── log.c                   # Logging initialization
+    ├── log.c                   # Logging initialization
+    └── astrostack.c            # Standalone astrophotography frame stacker
 ```
 
 ## Data Pipeline

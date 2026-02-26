@@ -17,6 +17,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR/.."
 INVENTORY="$SCRIPT_DIR/cameras.json"
+THINGINO_DIR="${THINGINO_DIR:-$HOME/work/github/thingino-firmware}"
+export THINGINO_DIR
 
 # --- helper functions ---
 
@@ -50,8 +52,9 @@ deploy_to_camera() {
     [ -n "$name" ] && label="$name ($ip)"
 
     echo ""
-    echo "=== Pushing binary to root@${label}:/tmp/ ==="
-    scp -O "$build_dir/meteor" "root@${ip}:/tmp/"
+    echo "=== Pushing binaries to root@${label}:/tmp/ ==="
+    scp -O "$build_dir/meteor" "$build_dir/astrostack" \
+        "$PROJECT_DIR/scripts/nightsky.sh" "root@${ip}:/tmp/"
     echo "  Done: $label"
 }
 
@@ -73,7 +76,7 @@ lookup_camera() {
 
 # --- main ---
 
-if [ $# -eq 0 ]; then
+if [ $# -eq 0 ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "Usage:"
     echo "  deploy_binaries.sh <name>           Deploy to a camera by name"
     echo "  deploy_binaries.sh <platform> <ip>  Deploy to a specific IP"
@@ -91,22 +94,18 @@ if [ "$1" = "--all" ]; then
         exit 1
     fi
 
-    # Collect the unique platforms we need to build
+    # Collect the unique platforms we need to build (normalize to lowercase)
     if [ -n "$FILTER_PLATFORM" ]; then
-        PLATFORMS="$FILTER_PLATFORM"
+        PLATFORMS="$(echo "$FILTER_PLATFORM" | tr '[:upper:]' '[:lower:]')"
     else
-        PLATFORMS="$(jq -r '.[].platform' "$INVENTORY" | sort -u)"
+        PLATFORMS="$(jq -r '.[].platform' "$INVENTORY" | tr '[:upper:]' '[:lower:]' | sort -u)"
     fi
 
     # Build once per platform, then deploy to all cameras of that platform
     for plat in $PLATFORMS; do
         build_platform "$plat"
 
-        if [ -n "$FILTER_PLATFORM" ]; then
-            CAMERAS="$(jq -c --arg p "$plat" '.[] | select(.platform == $p)' "$INVENTORY")"
-        else
-            CAMERAS="$(jq -c --arg p "$plat" '.[] | select(.platform == $p)' "$INVENTORY")"
-        fi
+        CAMERAS="$(jq -c --arg p "$plat" '.[] | select(.platform | ascii_downcase == $p)' "$INVENTORY")"
 
         while IFS= read -r cam; do
             cam_ip="$(echo "$cam" | jq -r '.ip')"
@@ -120,7 +119,7 @@ if [ "$1" = "--all" ]; then
 
 elif [ $# -eq 2 ]; then
     # Two args: platform + ip (original behavior)
-    PLATFORM="$1"
+    PLATFORM="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
     CAMERA_IP="$2"
     build_platform "$PLATFORM"
     deploy_to_camera "$PLATFORM" "$CAMERA_IP"
@@ -134,7 +133,7 @@ else
     # Single arg: camera name lookup
     NAME="$1"
     ENTRY="$(lookup_camera "$NAME")"
-    PLATFORM="$(echo "$ENTRY" | jq -r '.platform')"
+    PLATFORM="$(echo "$ENTRY" | jq -r '.platform | ascii_downcase')"
     CAMERA_IP="$(echo "$ENTRY" | jq -r '.ip')"
 
     build_platform "$PLATFORM"

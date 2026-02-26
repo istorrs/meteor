@@ -6,10 +6,13 @@ Checks: >
   security-*,
   -cert-dcl37-c,
   -cert-dcl51-c,
-  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -bugprone-easily-swappable-parameters
 
-# DeprecatedOrUnsafeBufferHandling is disabled because it recommends C11
-# Annex K functions (memset_s, fprintf_s, etc.) which are not implemented
-# in musl libc (our target platform).
+# DeprecatedOrUnsafeBufferHandling: recommends C11 Annex K functions
+# (memset_s, fprintf_s, etc.) which are not implemented in musl libc.
+#
+# bugprone-easily-swappable-parameters: too noisy for callback-style APIs
+# and image processing functions with multiple size/pointer parameters.
 
 HeaderFilterRegex: 'include/meteor/.*'

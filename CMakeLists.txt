@@ -40,12 +40,17 @@ set(SOURCES
     src/main.c
     src/system.c
     src/isp.c
+    src/isp_tuning.c
     src/framesource.c
     src/ivs.c
     src/log.c
+    src/jpeg.c
+    src/config.c
+    src/event.c
+    src/capture.c
 )
 
-# Build executable
+# Build meteor executable
 add_executable(meteor ${SOURCES})
 
 # Link libraries
@@ -55,6 +60,21 @@ target_link_libraries(meteor
     alog
     sysutils
     muslshim
+    jpeg
+    pthread
+    m
+    rt
+)
+
+# Build astrostack executable (standalone astrophotography stacker)
+add_executable(astrostack src/astrostack.c src/jpeg.c src/log.c)
+
+target_link_libraries(astrostack
+    imp
+    alog
+    sysutils
+    muslshim
+    jpeg
     pthread
     m
     rt

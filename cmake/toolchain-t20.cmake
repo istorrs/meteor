@@ -29,7 +29,13 @@ if(NOT EXISTS "${THINGINO_OUTPUT}/host/bin")
 endif()
 
 # Optional: thingino-firmware source tree (for SDK headers in dl/)
-set(THINGINO_DIR "" CACHE PATH "Path to thingino-firmware source (optional, for dl/ fallback)")
+if(NOT DEFINED THINGINO_DIR OR THINGINO_DIR STREQUAL "")
+    if(DEFINED ENV{THINGINO_DIR})
+        set(THINGINO_DIR "$ENV{THINGINO_DIR}" CACHE PATH "Path to thingino-firmware source" FORCE)
+    else()
+        set(THINGINO_DIR "" CACHE PATH "Path to thingino-firmware source (optional, for dl/ fallback)")
+    endif()
+endif()
 
 # Toolchain
 set(CROSS_COMPILE "mipsel-linux-" CACHE STRING "Cross-compilation prefix")
@@ -53,13 +59,15 @@ set(SDK_VERSION "3.12.0" CACHE STRING "SDK version")
 # Find prudynt include dir in build output (hash in dirname varies)
 # The zh/ directory contains imp/ and sysutils/ subdirectories,
 # so we include the parent so that #include <imp/...> and <sysutils/...> work.
+# T20 SDK headers also use bare #include <imp_common.h> internally,
+# so the imp/ subdirectory itself must be on the include path too.
 file(GLOB _PRUDYNT_DIRS "${THINGINO_OUTPUT}/build/prudynt-t-*/include/${SOC_FAMILY}/${SDK_VERSION}/zh")
 if(_PRUDYNT_DIRS)
     list(GET _PRUDYNT_DIRS 0 _PRUDYNT_INC)
-    set(IMP_SDK_INC_DIR "${_PRUDYNT_INC}" CACHE PATH "IMP/sysutils SDK header directory")
+    set(IMP_SDK_INC_DIR "${_PRUDYNT_INC};${_PRUDYNT_INC}/imp" CACHE PATH "IMP/sysutils SDK header directory")
 elseif(THINGINO_DIR AND EXISTS "${THINGINO_DIR}/dl/prudynt-t/git/include/${SOC_FAMILY}/${SDK_VERSION}/zh/imp")
-    set(IMP_SDK_INC_DIR
-        "${THINGINO_DIR}/dl/prudynt-t/git/include/${SOC_FAMILY}/${SDK_VERSION}/zh"
+    set(_PRUDYNT_INC "${THINGINO_DIR}/dl/prudynt-t/git/include/${SOC_FAMILY}/${SDK_VERSION}/zh")
+    set(IMP_SDK_INC_DIR "${_PRUDYNT_INC};${_PRUDYNT_INC}/imp"
         CACHE PATH "IMP/sysutils SDK header directory")
 else()
     message(FATAL_ERROR "Cannot find IMP SDK headers in build output or THINGINO_DIR.")

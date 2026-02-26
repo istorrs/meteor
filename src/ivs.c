@@ -5,24 +5,46 @@
 #include <meteor/log.h>
 
 static IMPIVSInterface *move_intf = NULL;
+static int configured_roi_count = 0;
 
-int meteor_ivs_init(int grp, int chn, int width, int height, int sense)
+int meteor_ivs_init(int grp, int chn, int width, int height,
+		    int sense, int grid_cols, int grid_rows)
 {
 	IMP_IVS_MoveParam param;
-	int ret;
+	int col, row, idx, ret;
+	int cell_w, cell_h;
 
 	memset(&param, 0, sizeof(param));
 	param.skipFrameCnt = 5;
 	param.frameInfo.width = width;
 	param.frameInfo.height = height;
-	param.roiRectCnt = 1;
 
-	/* Full-frame single ROI */
-	param.roiRect[0].p0.x = 0;
-	param.roiRect[0].p0.y = 0;
-	param.roiRect[0].p1.x = width - 1;
-	param.roiRect[0].p1.y = height - 1;
-	param.sense[0] = sense;
+	cell_w = width / grid_cols;
+	cell_h = height / grid_rows;
+	param.roiRectCnt = grid_cols * grid_rows;
+
+	for (row = 0; row < grid_rows; row++) {
+		for (col = 0; col < grid_cols; col++) {
+			idx = row * grid_cols + col;
+			param.roiRect[idx].p0.x = col * cell_w;
+			param.roiRect[idx].p0.y = row * cell_h;
+			param.roiRect[idx].p1.x = (col + 1) * cell_w - 1;
+			param.roiRect[idx].p1.y = (row + 1) * cell_h - 1;
+			param.sense[idx] = sense;
+		}
+	}
+
+	/* Extend last column/row to cover any remainder pixels */
+	for (row = 0; row < grid_rows; row++) {
+		idx = row * grid_cols + (grid_cols - 1);
+		param.roiRect[idx].p1.x = width - 1;
+	}
+	for (col = 0; col < grid_cols; col++) {
+		idx = (grid_rows - 1) * grid_cols + col;
+		param.roiRect[idx].p1.y = height - 1;
+	}
+
+	configured_roi_count = param.roiRectCnt;
 
 	move_intf = IMP_IVS_CreateMoveInterface(&param);
 	if (!move_intf) {
@@ -44,12 +66,14 @@ int meteor_ivs_init(int grp, int chn, int width, int height, int sense)
 
 	ret = IMP_IVS_RegisterChn(grp, chn);
 	if (ret) {
-		METEOR_LOG_ERR("IMP_IVS_RegisterChn(%d, %d) failed: %d", grp, chn, ret);
+		METEOR_LOG_ERR("IMP_IVS_RegisterChn(%d, %d) failed: %d",
+			       grp, chn, ret);
 		goto err_destroy_chn;
 	}
 
-	METEOR_LOG_INFO("IVS motion detection initialized: grp%d ch%d %dx%d sense=%d",
-			grp, chn, width, height, sense);
+	METEOR_LOG_INFO("IVS initialized: grp%d ch%d %dx%d grid=%dx%d (%d ROIs) sense=%d",
+			grp, chn, width, height, grid_cols, grid_rows,
+			param.roiRectCnt, sense);
 	return 0;
 
 err_destroy_chn:
@@ -76,29 +100,32 @@ int meteor_ivs_start(int chn)
 	return 0;
 }
 
-int meteor_ivs_poll(int chn, int timeout_ms)
+int meteor_ivs_poll(int chn, int timeout_ms, meteor_ivs_result *result)
 {
-	IMP_IVS_MoveOutput *result = NULL;
+	IMP_IVS_MoveOutput *output = NULL;
 	int ret, i;
 
 	ret = IMP_IVS_PollingResult(chn, timeout_ms);
 	if (ret) {
-		METEOR_LOG_ERR("IMP_IVS_PollingResult(%d) failed: %d", chn, ret);
+		/* Timeout is normal, not an error */
 		return ret;
 	}
 
-	ret = IMP_IVS_GetResult(chn, (void **)&result);
+	ret = IMP_IVS_GetResult(chn, (void **)&output);
 	if (ret) {
 		METEOR_LOG_ERR("IMP_IVS_GetResult(%d) failed: %d", chn, ret);
 		return ret;
 	}
 
-	for (i = 0; i < IMP_IVS_MOVE_MAX_ROI_CNT; i++) {
-		if (result->retRoi[i])
-			METEOR_LOG_INFO("motion detected in ROI %d", i);
+	result->triggered = 0;
+	result->roi_count = configured_roi_count;
+	for (i = 0; i < configured_roi_count; i++) {
+		result->roi[i] = output->retRoi[i] ? 1 : 0;
+		if (result->roi[i])
+			result->triggered++;
 	}
 
-	ret = IMP_IVS_ReleaseResult(chn, (void *)result);
+	ret = IMP_IVS_ReleaseResult(chn, (void *)output);
 	if (ret) {
 		METEOR_LOG_ERR("IMP_IVS_ReleaseResult(%d) failed: %d", chn, ret);
 		return ret;

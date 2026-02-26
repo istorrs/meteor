@@ -29,6 +29,7 @@ echo "=== cppcheck ==="
 if ! cppcheck --enable=warning,performance,portability \
     --suppress=unusedFunction \
     --suppress=missingIncludeSystem \
+    --suppress=normalCheckLevelMaxBranches \
     --project=compile_commands.json \
     --error-exitcode=1 \
     --quiet 2>&1; then
