@@ -20,6 +20,7 @@
  *     -m THRESH    Composite bright transients (meteors) onto stacked image
  *                  Pixels where max-avg > THRESH are replaced with max value
  *                  (default threshold if omitted: 40, valid range: 1-255)
+ *     -D           Capture dark frame (cover the lens!) and save to output dir
  */
 
 #include <getopt.h>
@@ -75,6 +76,7 @@
 #define NRVBS           3
 #define DEFAULT_METEOR_THRESH 40
 #define MIN_MOTION_PIXELS     50
+#define DARK_FILENAME         "dark.raw"
 
 /* --- signal handling ---------------------------------------------------- */
 
@@ -442,10 +444,200 @@ static void framesource_exit(void)
 	IMP_FrameSource_DestroyChn(FS_CHN);
 }
 
+/* --- dark frame capture / load ------------------------------------------ */
+
+static int capture_dark(int num_frames, int grayscale,
+			const char *output_dir)
+{
+	int y_size = WIDTH * HEIGHT;
+	int uv_size = WIDTH * (HEIGHT / 2);
+	uint32_t *y_acc = NULL;
+	uint32_t *uv_acc = NULL;
+	uint8_t *y_avg = NULL;
+	uint8_t *uv_avg = NULL;
+	char dark_path[PATH_MAX]; /* flawfinder: ignore */
+	FILE *fp;
+	int i, ret;
+
+	(void)snprintf(dark_path, sizeof(dark_path), "%s/%s",
+		       output_dir, DARK_FILENAME);
+
+	y_acc = calloc((size_t)y_size, sizeof(uint32_t));
+	y_avg = malloc((size_t)y_size);
+	if (!grayscale) {
+		uv_acc = calloc((size_t)uv_size, sizeof(uint32_t));
+		uv_avg = malloc((size_t)uv_size);
+	}
+
+	if (!y_acc || !y_avg || (!grayscale && (!uv_acc || !uv_avg))) {
+		LOG_ERR("failed to allocate dark frame buffers");
+		ret = -1;
+		goto cleanup;
+	}
+
+	LOG_INFO("capturing %d dark frames...", num_frames);
+
+	for (i = 0; i < num_frames && running; i++) {
+		IMPFrameInfo *frame = NULL;
+		uint8_t *data;
+		int j;
+
+		ret = IMP_FrameSource_GetFrame(FS_CHN, &frame);
+		if (ret) {
+			LOG_ERR("GetFrame failed on dark frame %d: %d",
+				i + 1, ret);
+			goto cleanup;
+		}
+
+		data = (uint8_t *)(unsigned long)frame->virAddr;
+
+		for (j = 0; j < y_size; j++)
+			y_acc[j] += data[j];
+
+		if (!grayscale) {
+			for (j = 0; j < uv_size; j++)
+				uv_acc[j] += data[y_size + j];
+		}
+
+		ret = IMP_FrameSource_ReleaseFrame(FS_CHN, frame);
+		if (ret)
+			LOG_WARN("ReleaseFrame failed: %d", ret);
+
+		LOG_INFO("  dark frame %d/%d", i + 1, num_frames);
+	}
+
+	if (!running) {
+		LOG_INFO("interrupted after %d dark frames", i);
+		num_frames = i;
+	}
+
+	if (num_frames == 0) {
+		LOG_ERR("no dark frames captured");
+		ret = -1;
+		goto cleanup;
+	}
+
+	for (i = 0; i < y_size; i++)
+		y_avg[i] = (uint8_t)(y_acc[i] / (uint32_t)num_frames);
+
+	if (!grayscale) {
+		for (i = 0; i < uv_size; i++)
+			uv_avg[i] = (uint8_t)(uv_acc[i]
+					      / (uint32_t)num_frames);
+	}
+
+	fp = fopen(dark_path, "wb"); /* flawfinder: ignore */
+	if (!fp) {
+		LOG_ERR("cannot open %s for writing", dark_path);
+		ret = -1;
+		goto cleanup;
+	}
+
+	if (fwrite(y_avg, 1, (size_t)y_size, fp) != (size_t)y_size) {
+		LOG_ERR("failed to write Y plane to %s", dark_path);
+		(void)fclose(fp);
+		ret = -1;
+		goto cleanup;
+	}
+
+	if (!grayscale) {
+		if (fwrite(uv_avg, 1, (size_t)uv_size, fp)
+		    != (size_t)uv_size) {
+			LOG_ERR("failed to write UV plane to %s", dark_path);
+			(void)fclose(fp);
+			ret = -1;
+			goto cleanup;
+		}
+	}
+
+	(void)fclose(fp);
+	LOG_INFO("dark frame saved to %s (%d frames averaged)", dark_path,
+		 num_frames);
+	ret = 0;
+
+cleanup:
+	free(y_acc);
+	free(uv_acc);
+	free(y_avg);
+	free(uv_avg);
+	return ret;
+}
+
+static int load_dark(const char *dark_path, int grayscale,
+		     uint8_t **y_dark_out, uint8_t **uv_dark_out)
+{
+	int y_size = WIDTH * HEIGHT;
+	int uv_size = WIDTH * (HEIGHT / 2);
+	size_t color_size = (size_t)y_size + (size_t)uv_size;
+	size_t gray_size = (size_t)y_size;
+	struct stat st;
+	FILE *fp;
+	int has_uv = 0;
+
+	*y_dark_out = NULL;
+	*uv_dark_out = NULL;
+
+	if (stat(dark_path, &st) != 0)
+		return -1;
+
+	if ((size_t)st.st_size == color_size)
+		has_uv = 1;
+	else if ((size_t)st.st_size == gray_size)
+		has_uv = 0;
+	else {
+		LOG_WARN("dark frame %s has unexpected size %ld "
+			 "(expected %zu or %zu)", dark_path,
+			 (long)st.st_size, color_size, gray_size);
+		return -1;
+	}
+
+	fp = fopen(dark_path, "rb"); /* flawfinder: ignore */
+	if (!fp)
+		return -1;
+
+	*y_dark_out = malloc((size_t)y_size);
+	if (!*y_dark_out) {
+		(void)fclose(fp);
+		return -1;
+	}
+
+	if (fread(*y_dark_out, 1, (size_t)y_size, fp) != (size_t)y_size) {
+		free(*y_dark_out);
+		*y_dark_out = NULL;
+		(void)fclose(fp);
+		return -1;
+	}
+
+	if (!grayscale && has_uv) {
+		*uv_dark_out = malloc((size_t)uv_size);
+		if (!*uv_dark_out) {
+			free(*y_dark_out);
+			*y_dark_out = NULL;
+			(void)fclose(fp);
+			return -1;
+		}
+
+		if (fread(*uv_dark_out, 1, (size_t)uv_size, fp)
+		    != (size_t)uv_size) {
+			free(*y_dark_out);
+			free(*uv_dark_out);
+			*y_dark_out = NULL;
+			*uv_dark_out = NULL;
+			(void)fclose(fp);
+			return -1;
+		}
+	}
+
+	(void)fclose(fp);
+	return 0;
+}
+
 /* --- stacking ----------------------------------------------------------- */
 
 static int stack_frames(int num_frames, int grayscale, int clip,
-			int meteor_thresh, const char *output, int quality)
+			int meteor_thresh, const uint8_t *y_dark,
+			const uint8_t *uv_dark, const char *output,
+			int quality)
 {
 	int y_size = WIDTH * HEIGHT;
 	int uv_size = WIDTH * (HEIGHT / 2);
@@ -671,6 +863,21 @@ static int stack_frames(int num_frames, int grayscale, int clip,
 			 100.0 * composited / y_size);
 	}
 
+	/* Subtract dark frame */
+	if (y_dark) {
+		LOG_INFO("subtracting dark frame");
+		for (i = 0; i < y_size; i++) {
+			int v = y_avg[i] - y_dark[i];
+			y_avg[i] = (uint8_t)(v > 0 ? v : 0);
+		}
+		if (!grayscale && uv_dark) {
+			for (i = 0; i < uv_size; i++) {
+				int v = uv_avg[i] - uv_dark[i] + 128;
+				uv_avg[i] = clamp8(v);
+			}
+		}
+	}
+
 	/* Write output */
 	if (grayscale)
 		ret = meteor_jpeg_write_gray(output, y_avg, WIDTH, HEIGHT,
@@ -712,6 +919,7 @@ static void usage(const char *prog)
 		"  -g        Output grayscale JPEG instead of color\n"
 		"  -c        Enable outlier rejection (min/max clipping)\n"
 		"  -m THRESH Composite bright transients (meteors) onto stack\n"
+		"  -D        Capture dark frame (cover the lens!) and save to output dir\n"
 		"  -h        Show this help\n",
 		prog, DEFAULT_FRAMES, DEFAULT_EXPOSURE, DEFAULT_OUTPUT,
 		DEFAULT_OUTPUT_DIR, DEFAULT_QUALITY);
@@ -728,10 +936,11 @@ int main(int argc, char **argv)
 	int clip = 0;
 	int meteor_thresh = 0;
 	int timelapse = 0;
+	int dark_mode = 0;
 	int opt, ret;
 	char path_buf[PATH_MAX]; /* flawfinder: ignore */
 
-	while ((opt = getopt(argc, argv, "n:e:o:d:t:q:m:gch")) != -1) { /* flawfinder: ignore */
+	while ((opt = getopt(argc, argv, "n:e:o:d:t:q:m:gcDh")) != -1) { /* flawfinder: ignore */
 		switch (opt) {
 		case 'n':
 			num_frames = (int)strtol(optarg, NULL, 10);
@@ -784,6 +993,9 @@ int main(int argc, char **argv)
 		case 'c':
 			clip = 1;
 			break;
+		case 'D':
+			dark_mode = 1;
+			break;
 		case 'h':
 			usage(argv[0]);
 			return 0;
@@ -825,7 +1037,13 @@ int main(int argc, char **argv)
 	if (ret)
 		goto err_isp;
 
-	/* 5. In timelapse mode, compute frame count from actual FPS
+	/* 5. Dark capture mode — capture and save, then exit */
+	if (dark_mode) {
+		ret = capture_dark(num_frames, grayscale, output_dir);
+		goto err_fs;
+	}
+
+	/* 6. In timelapse mode, compute frame count from actual FPS
 	 * so each stack fills the full interval with captures. */
 	if (timelapse) {
 		uint32_t fps_n = 0;
@@ -853,36 +1071,54 @@ int main(int argc, char **argv)
 		goto err_fs;
 	}
 
-	if (timelapse)
-		LOG_INFO("astrostack starting: %d frames per %ds, "
-			 "timelapse -> %s/",
-			 num_frames, timelapse, output_dir);
-	else
-		LOG_INFO("astrostack starting: %d x %ds subs -> %s/%s",
-			 num_frames, exposure, output_dir, output);
+	/* 7. Load dark frame if available */
+	{
+		uint8_t *y_dark = NULL;
+		uint8_t *uv_dark = NULL;
+		char dark_path[PATH_MAX]; /* flawfinder: ignore */
 
-	/* 6. Stack (single-shot or timelapse loop) */
-	if (timelapse) {
-		int frame_idx = 0;
+		(void)snprintf(dark_path, sizeof(dark_path), "%s/%s",
+			       output_dir, DARK_FILENAME);
 
-		while (running) {
-			(void)snprintf(path_buf, sizeof(path_buf),
-				       "%s/timelapse-%04d.jpg",
-				       output_dir, frame_idx);
+		if (load_dark(dark_path, grayscale, &y_dark, &uv_dark) == 0)
+			LOG_INFO("loaded dark frame from %s", dark_path);
 
+		if (timelapse)
+			LOG_INFO("astrostack starting: %d frames per %ds, "
+				 "timelapse -> %s/",
+				 num_frames, timelapse, output_dir);
+		else
+			LOG_INFO("astrostack starting: %d x %ds subs -> %s/%s",
+				 num_frames, exposure, output_dir, output);
+
+		/* 8. Stack (single-shot or timelapse loop) */
+		if (timelapse) {
+			int frame_idx = 0;
+
+			while (running) {
+				(void)snprintf(path_buf, sizeof(path_buf),
+					       "%s/timelapse-%04d.jpg",
+					       output_dir, frame_idx);
+
+				ret = stack_frames(num_frames, grayscale, clip,
+						   meteor_thresh, y_dark,
+						   uv_dark, path_buf,
+						   quality);
+				if (ret || !running)
+					break;
+
+				frame_idx++;
+			}
+		} else {
+			(void)snprintf(path_buf, sizeof(path_buf), "%s/%s",
+				       output_dir, output);
 			ret = stack_frames(num_frames, grayscale, clip,
-					   meteor_thresh, path_buf,
-					   quality);
-			if (ret || !running)
-				break;
-
-			frame_idx++;
+					   meteor_thresh, y_dark, uv_dark,
+					   path_buf, quality);
 		}
-	} else {
-		(void)snprintf(path_buf, sizeof(path_buf), "%s/%s",
-			       output_dir, output);
-		ret = stack_frames(num_frames, grayscale, clip,
-				   meteor_thresh, path_buf, quality);
+
+		free(y_dark);
+		free(uv_dark);
 	}
 
 	/* Teardown */
