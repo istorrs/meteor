@@ -38,4 +38,11 @@ int meteor_event_should_capture(const meteor_event_ctx *ctx);
 /* Record that a frame was just captured. */
 void meteor_event_frame_captured(meteor_event_ctx *ctx);
 
+/*
+ * Delete event directories under cfg->output_dir that are older than
+ * cfg->retention_days days.  No-op if retention_days == 0.
+ * Call once at startup before the main loop.
+ */
+void meteor_event_cleanup_old(const meteor_config *cfg);
+
 #endif /* METEOR_EVENT_H */

@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# Quick rebuild of meteor binary (thingino/MIPS) and SCP to camera /tmp.
-# Does NOT rebuild firmware — just pushes binary for immediate testing.
+# Rebuild and deploy camera binaries (thingino/MIPS) via SCP to /tmp.
+# Does NOT rebuild firmware — just pushes binaries for immediate testing.
+# Deploys: meteor (IVS motion), detector (RMS FTP meteor), nightcam (combined), astrostack, nightsky.sh
 #
 # Usage:
 #   deploy_binaries.sh <name>           Deploy to a camera by name (from cameras.json)
@@ -10,7 +11,8 @@
 #   deploy_binaries.sh --all <platform> Deploy to all cameras of a given platform
 #
 # On the camera, run from /tmp:
-#   /tmp/meteor
+#   /tmp/meteor       — IVS motion detection + JPEG capture
+#   /tmp/detector     — RMS FTP meteor detector
 
 set -euo pipefail
 
@@ -53,7 +55,8 @@ deploy_to_camera() {
 
     echo ""
     echo "=== Pushing binaries to root@${label}:/tmp/ ==="
-    scp -O "$build_dir/meteor" "$build_dir/astrostack" \
+    scp -O "$build_dir/meteor" "$build_dir/detector" "$build_dir/nightcam" \
+        "$build_dir/astrostack" \
         "$PROJECT_DIR/scripts/nightsky.sh" "root@${ip}:/tmp/"
     echo "  Done: $label"
 }
@@ -127,7 +130,9 @@ elif [ $# -eq 2 ]; then
     echo ""
     echo "=== Done. Test on camera with: ==="
     echo "  ssh root@${CAMERA_IP}"
-    echo "  /tmp/meteor"
+    echo "  /tmp/meteor       # IVS motion detection"
+    echo "  /tmp/detector     # RMS FTP meteor detector"
+    echo "  /tmp/nightcam     # combined detector + stacker + IVS"
 
 else
     # Single arg: camera name lookup
@@ -142,5 +147,7 @@ else
     echo ""
     echo "=== Done. Test on camera with: ==="
     echo "  ssh root@${CAMERA_IP}"
-    echo "  /tmp/meteor"
+    echo "  /tmp/meteor       # IVS motion detection"
+    echo "  /tmp/detector     # RMS FTP meteor detector"
+    echo "  /tmp/nightcam     # combined detector + stacker + IVS"
 fi

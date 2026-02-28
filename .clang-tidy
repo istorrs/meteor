@@ -6,6 +6,8 @@ Checks: >
   security-*,
   -cert-dcl37-c,
   -cert-dcl51-c,
+  -cert-dcl51-cpp,
+  -bugprone-reserved-identifier,
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
   -bugprone-easily-swappable-parameters
 

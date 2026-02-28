@@ -72,10 +72,13 @@ int main(int argc, char **argv)
 			cfg.sensitivity, cfg.grid_cols, cfg.grid_rows,
 			cfg.cooldown_secs, cfg.capture_interval_ms,
 			cfg.output_dir);
+	METEOR_LOG_INFO("storage: max_frames=%d retention=%dd",
+			cfg.max_event_frames, cfg.retention_days);
 
 	if (ensure_output_dir(cfg.output_dir))
 		return 1;
 
+	meteor_event_cleanup_old(&cfg);
 	meteor_event_init(&evt, &cfg);
 
 	/* 1. System */
@@ -126,7 +129,7 @@ int main(int argc, char **argv)
 
 	METEOR_LOG_INFO("pipeline running — press Ctrl+C to stop");
 
-	/* 10. Main loop: poll -> event_update -> conditional capture */
+	/* 10. Main loop: poll → event_update → conditional capture */
 	while (running) {
 		ret = meteor_ivs_poll(IVS_CHN, POLL_MS, &ivs_result);
 		if (ret) {

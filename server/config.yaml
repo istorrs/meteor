@@ -1,0 +1,15 @@
+# receiver.py — N100 server configuration
+
+listen_host: "0.0.0.0"
+listen_port: 8765
+
+# Root of the RMS data tree (~/RMS_data by default)
+rms_data_dir: "~/RMS_data"
+captured_subdir: "CapturedFiles"
+
+# Set to true to run RMS DetectStarsAndMeteors after each FF file arrives.
+# Leave false during initial testing to avoid spurious RMS runs.
+rms_run_on_receive: false
+rms_detect_script: "python3 -m RMS.DetectStarsAndMeteors"
+
+log_level: "INFO"

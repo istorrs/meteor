@@ -35,27 +35,81 @@ link_directories(${IMP_SDK_LIB_DIR})
 # Compiler flags
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -O2 -march=mips32r2")
 
-# Source files
-set(SOURCES
-    src/main.c
+# Common IMP pipeline sources (shared by both executables)
+set(COMMON_SOURCES
     src/system.c
     src/isp.c
     src/isp_tuning.c
     src/framesource.c
-    src/ivs.c
     src/log.c
-    src/jpeg.c
     src/config.c
+)
+
+# meteor — IVS motion detection + JPEG capture
+set(METEOR_SOURCES
+    ${COMMON_SOURCES}
+    src/main.c
+    src/ivs.c
+    src/jpeg.c
     src/event.c
     src/capture.c
 )
 
-# Build meteor executable
-add_executable(meteor ${SOURCES})
+add_executable(meteor ${METEOR_SOURCES})
 
-# Link libraries
 # muslshim: bridges uclibc symbols that libimp.so expects to musl equivalents
 target_link_libraries(meteor
+    imp
+    alog
+    sysutils
+    muslshim
+    jpeg
+    pthread
+    m
+    rt
+)
+
+# detector — RMS FTP meteor detector (no IVS, no JPEG capture)
+set(DETECTOR_SOURCES
+    ${COMMON_SOURCES}
+    src/detector_main.c
+    src/ftp.c
+    src/hough.c
+    src/ff_writer.c
+    src/event_push.c
+    src/detector.c
+    src/meteor_module.c
+)
+
+add_executable(detector ${DETECTOR_SOURCES})
+
+target_link_libraries(detector
+    imp
+    alog
+    sysutils
+    muslshim
+    pthread
+    m
+    rt
+)
+
+# nightcam — combined FTP meteor detector + timelapse stacker + IVS metadata
+set(NIGHTCAM_SOURCES
+    ${COMMON_SOURCES}
+    src/nightcam_main.c
+    src/ftp.c
+    src/hough.c
+    src/ff_writer.c
+    src/event_push.c
+    src/detector.c
+    src/ivs.c
+    src/ivs_monitor.c
+    src/stacker.c
+)
+
+add_executable(nightcam ${NIGHTCAM_SOURCES})
+
+target_link_libraries(nightcam
     imp
     alog
     sysutils

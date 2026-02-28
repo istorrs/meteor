@@ -1,7 +1,9 @@
 #include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <meteor/config.h>
+#include <meteor/meteor_config.h>
 
 #define DEFAULT_SENSITIVITY       3
 #define DEFAULT_GRID_COLS         8
@@ -9,6 +11,8 @@
 #define DEFAULT_COOLDOWN_SECS     5
 #define DEFAULT_CAPTURE_INTERVAL  500
 #define DEFAULT_OUTPUT_DIR        "/mnt/mmcblk0p1/meteor"
+#define DEFAULT_MAX_EVENT_FRAMES  30
+#define DEFAULT_RETENTION_DAYS    7
 
 #define MAX_ROI_COUNT             52
 
@@ -20,6 +24,12 @@ void meteor_config_defaults(meteor_config *cfg)
 	cfg->cooldown_secs = DEFAULT_COOLDOWN_SECS;
 	cfg->capture_interval_ms = DEFAULT_CAPTURE_INTERVAL;
 	cfg->output_dir = DEFAULT_OUTPUT_DIR;
+	(void)snprintf(cfg->server_ip,   sizeof(cfg->server_ip),
+		       "%s", DETECTOR_DEFAULT_SERVER_IP);
+	(void)snprintf(cfg->station_id,  sizeof(cfg->station_id),
+		       "%s", DETECTOR_DEFAULT_STATION_ID);
+	cfg->max_event_frames = DEFAULT_MAX_EVENT_FRAMES;
+	cfg->retention_days   = DEFAULT_RETENTION_DAYS;
 }
 
 static void usage(const char *prog)
@@ -32,10 +42,16 @@ static void usage(const char *prog)
 		"  -c SECS   Cooldown seconds before event ends (default: %d)\n"
 		"  -f MS     Min ms between frame captures (default: %d)\n"
 		"  -o DIR    Output directory (default: %s)\n"
+		"  -S IP     N100 receiver IP for RMS detector (default: %s)\n"
+		"  -I ID     RMS station ID, e.g. XX0001 (default: %s)\n"
+		"  -m N      Max JPEG frames per event, 0=unlimited (default: %d)\n"
+		"  -R DAYS   Delete events older than DAYS days, 0=off (default: %d)\n"
 		"  -h        Show this help\n",
 		prog, DEFAULT_SENSITIVITY, DEFAULT_GRID_COLS,
 		DEFAULT_GRID_ROWS, DEFAULT_COOLDOWN_SECS,
-		DEFAULT_CAPTURE_INTERVAL, DEFAULT_OUTPUT_DIR);
+		DEFAULT_CAPTURE_INTERVAL, DEFAULT_OUTPUT_DIR,
+		DETECTOR_DEFAULT_SERVER_IP, DETECTOR_DEFAULT_STATION_ID,
+		DEFAULT_MAX_EVENT_FRAMES, DEFAULT_RETENTION_DAYS);
 }
 
 int meteor_config_parse(meteor_config *cfg, int argc, char **argv)
@@ -44,7 +60,7 @@ int meteor_config_parse(meteor_config *cfg, int argc, char **argv)
 
 	meteor_config_defaults(cfg);
 
-	while ((opt = getopt(argc, argv, "s:g:r:c:f:o:h")) != -1) { /* flawfinder: ignore */
+	while ((opt = getopt(argc, argv, "s:g:r:c:f:o:S:I:m:R:h")) != -1) { /* flawfinder: ignore */
 		switch (opt) {
 		case 's':
 			cfg->sensitivity = (int)strtol(optarg, NULL, 10);
@@ -88,6 +104,30 @@ int meteor_config_parse(meteor_config *cfg, int argc, char **argv)
 			break;
 		case 'o':
 			cfg->output_dir = optarg;
+			break;
+		case 'S':
+			(void)snprintf(cfg->server_ip, sizeof(cfg->server_ip),
+				       "%s", optarg);
+			break;
+		case 'I':
+			(void)snprintf(cfg->station_id, sizeof(cfg->station_id),
+				       "%s", optarg);
+			break;
+		case 'm':
+			cfg->max_event_frames = (int)strtol(optarg, NULL, 10);
+			if (cfg->max_event_frames < 0) {
+				(void)fprintf(stderr,
+					      "max event frames must be >= 0\n");
+				return -1;
+			}
+			break;
+		case 'R':
+			cfg->retention_days = (int)strtol(optarg, NULL, 10);
+			if (cfg->retention_days < 0) {
+				(void)fprintf(stderr,
+					      "retention days must be >= 0\n");
+				return -1;
+			}
 			break;
 		case 'h': /* fall through */
 		default:

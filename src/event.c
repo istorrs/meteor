@@ -1,7 +1,10 @@
 #include <errno.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 #include <meteor/event.h>
 #include <meteor/log.h>
 
@@ -136,6 +139,11 @@ int meteor_event_should_capture(const meteor_event_ctx *ctx)
 	if (ctx->state == METEOR_EVENT_IDLE)
 		return 0;
 
+	/* Stop capturing once the per-event frame cap is reached */
+	if (ctx->cfg->max_event_frames > 0 &&
+	    ctx->frame_count >= ctx->cfg->max_event_frames)
+		return 0;
+
 	get_time(&now);
 	return elapsed_ms(&ctx->last_capture, &now) >=
 	       (int64_t)ctx->cfg->capture_interval_ms;
@@ -145,4 +153,91 @@ void meteor_event_frame_captured(meteor_event_ctx *ctx)
 {
 	ctx->frame_count++;
 	get_time(&ctx->last_capture);
+}
+
+/* -------------------------------------------------------------------------
+ * Old-event cleanup
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Remove all regular files inside path, then rmdir path.
+ * Event directories contain only flat files (no subdirectories), so a
+ * single-level sweep is sufficient.
+ */
+static int remove_event_dir(const char *path)
+{
+	char            filepath[512]; /* flawfinder: ignore */
+	DIR            *d;
+	struct dirent  *ent;
+	int             rc = 0;
+
+	d = opendir(path);
+	if (!d)
+		return -1;
+
+	while ((ent = readdir(d)) != NULL) {
+		if (ent->d_name[0] == '.')
+			continue;
+		(void)snprintf(filepath, sizeof(filepath),
+			       "%s/%s", path, ent->d_name);
+		if (unlink(filepath) < 0)
+			rc = -1;
+	}
+	(void)closedir(d);
+
+	if (rmdir(path) < 0)
+		rc = -1;
+
+	return rc;
+}
+
+void meteor_event_cleanup_old(const meteor_config *cfg)
+{
+	DIR            *d;
+	struct dirent  *ent;
+	struct stat     st;
+	char            path[512]; /* flawfinder: ignore */
+	time_t          cutoff;
+	int             removed = 0;
+
+	if (cfg->retention_days <= 0)
+		return;
+
+	cutoff = time(NULL) - (time_t)cfg->retention_days * 86400;
+
+	d = opendir(cfg->output_dir);
+	if (!d) {
+		METEOR_LOG_WARN("cleanup: cannot open %s", cfg->output_dir);
+		return;
+	}
+
+	while ((ent = readdir(d)) != NULL) {
+		if (ent->d_name[0] == '.')
+			continue;
+
+		(void)snprintf(path, sizeof(path),
+			       "%s/%s", cfg->output_dir, ent->d_name);
+
+		if (stat(path, &st) < 0)
+			continue;
+
+		if (!S_ISDIR(st.st_mode))
+			continue;
+
+		if (st.st_mtime >= cutoff)
+			continue;
+
+		if (remove_event_dir(path) == 0) {
+			METEOR_LOG_INFO("cleanup: removed %s", path);
+			removed++;
+		} else {
+			METEOR_LOG_WARN("cleanup: failed to remove %s", path);
+		}
+	}
+
+	(void)closedir(d);
+
+	if (removed > 0)
+		METEOR_LOG_INFO("cleanup: removed %d old event director%s",
+				removed, removed == 1 ? "y" : "ies");
 }
