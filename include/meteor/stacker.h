@@ -18,9 +18,18 @@
 #include <meteor/event_push.h>
 #include <meteor/ivs_monitor.h>
 
-/* Full sensor resolution fed to the stacker. */
-#define STACKER_WIDTH   1920
-#define STACKER_HEIGHT  1080
+/* Full sensor resolution fed to the stacker (accumulator dimensions). */
+#define STACKER_WIDTH    1920
+#define STACKER_HEIGHT   1080
+
+/*
+ * Output resolution after 2×2 box-downsample.  Each output pixel averages
+ * 4 spatial neighbours × N temporal frames, giving √(4N) SNR improvement
+ * vs a single raw frame.  960×540 is sufficient for RMS stack analysis
+ * and produces ~4× smaller JPEG files than the full 1920×1080 source.
+ */
+#define STACKER_OUT_WIDTH  (STACKER_WIDTH  / 2)   /* 960  */
+#define STACKER_OUT_HEIGHT (STACKER_HEIGHT / 2)   /* 540  */
 
 typedef struct {
 	/* Configuration */
@@ -44,8 +53,8 @@ typedef struct {
 	 * Owned by encode thread when enc_pending == 1.
 	 * The transition is protected by mutex + cond.
 	 */
-	uint8_t   *y_avg;   /* STACKER_WIDTH * STACKER_HEIGHT  uint8 */
-	uint8_t   *uv_avg;  /* STACKER_WIDTH * (STACKER_HEIGHT/2) uint8 */
+	uint8_t   *y_avg;   /* STACKER_OUT_WIDTH * STACKER_OUT_HEIGHT  uint8 */
+	uint8_t   *uv_avg;  /* STACKER_OUT_WIDTH * (STACKER_OUT_HEIGHT/2) uint8 */
 
 	/*
 	 * Optional dark frame — loaded once at create time, read-only

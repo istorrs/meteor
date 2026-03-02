@@ -32,7 +32,7 @@ static int write_jpeg_nv12(const char *path, const uint8_t *y,
 	FILE *fp;
 	struct jpeg_compress_struct cinfo;
 	struct jpeg_error_mgr       jerr;
-	uint8_t  row[STACKER_WIDTH * 3]; /* flawfinder: ignore */
+	uint8_t  row[STACKER_OUT_WIDTH * 3]; /* flawfinder: ignore */
 	JSAMPROW row_ptr[1];
 	int x, r;
 
@@ -44,8 +44,8 @@ static int write_jpeg_nv12(const char *path, const uint8_t *y,
 	jpeg_create_compress(&cinfo);
 	jpeg_stdio_dest(&cinfo, fp);
 
-	cinfo.image_width      = (JDIMENSION)STACKER_WIDTH;
-	cinfo.image_height     = (JDIMENSION)STACKER_HEIGHT;
+	cinfo.image_width      = (JDIMENSION)STACKER_OUT_WIDTH;
+	cinfo.image_height     = (JDIMENSION)STACKER_OUT_HEIGHT;
 	cinfo.input_components = 3;
 	cinfo.in_color_space   = JCS_RGB;
 
@@ -55,10 +55,10 @@ static int write_jpeg_nv12(const char *path, const uint8_t *y,
 
 	row_ptr[0] = row;
 
-	for (r = 0; r < STACKER_HEIGHT; r++) {
-		for (x = 0; x < STACKER_WIDTH; x++) {
-			int yi  = r * STACKER_WIDTH + x;
-			int uvi = (r / 2) * STACKER_WIDTH + (x & ~1);
+	for (r = 0; r < STACKER_OUT_HEIGHT; r++) {
+		for (x = 0; x < STACKER_OUT_WIDTH; x++) {
+			int yi  = r * STACKER_OUT_WIDTH + x;
+			int uvi = (r / 2) * STACKER_OUT_WIDTH + (x & ~1);
 			int yv  = (int)y[yi];
 			int u   = (int)uv[uvi]     - 128;
 			int v   = (int)uv[uvi + 1] - 128;
@@ -269,8 +269,8 @@ StackerState *stacker_create(const PushConfig *push_cfg,
 
 	st->y_acc  = calloc(y_sz,  sizeof(uint32_t));
 	st->uv_acc = calloc(uv_sz, sizeof(uint32_t));
-	st->y_avg  = malloc(y_sz);
-	st->uv_avg = malloc(uv_sz);
+	st->y_avg  = malloc((size_t)(STACKER_OUT_WIDTH * STACKER_OUT_HEIGHT));
+	st->uv_avg = malloc((size_t)(STACKER_OUT_WIDTH * (STACKER_OUT_HEIGHT / 2)));
 
 	if (!st->y_acc || !st->uv_acc || !st->y_avg || !st->uv_avg)
 		goto err;
@@ -355,32 +355,104 @@ void stacker_on_frame(StackerState *st, const uint8_t *nv12_data,
 	if (st->frame_count < st->frames_per_stack)
 		return;
 
-	/* Stack complete — compute average */
+	/*
+	 * Stack complete — 2×2 spatial box-downsample combined with temporal
+	 * average.  Each output pixel accumulates 4 spatial neighbours × n
+	 * temporal frames → divide by 4n.  Dark subtraction (if loaded) is
+	 * applied at full resolution before the spatial average so that
+	 * fixed-pattern noise is removed at the finest grain.
+	 *
+	 * Output: STACKER_OUT_WIDTH × STACKER_OUT_HEIGHT (960×540).
+	 */
 	n = (uint32_t)st->frame_count;
-	for (i = 0; i < y_sz; i++)
-		st->y_avg[i] = (uint8_t)(st->y_acc[i] / n);
-	for (i = 0; i < uv_sz; i++)
-		st->uv_avg[i] = (uint8_t)(st->uv_acc[i] / n);
+
+	/* Y plane */
+	{
+		int oy, ox;
+
+		for (oy = 0; oy < STACKER_OUT_HEIGHT; oy++) {
+			for (ox = 0; ox < STACKER_OUT_WIDTH; ox++) {
+				int      sy  = oy * 2;
+				int      sx  = ox * 2;
+				int      i00 = sy * STACKER_WIDTH + sx;
+				int      i01 = sy * STACKER_WIDTH + sx + 1;
+				int      i10 = (sy + 1) * STACKER_WIDTH + sx;
+				int      i11 = (sy + 1) * STACKER_WIDTH + sx + 1;
+				uint32_t sum = st->y_acc[i00] + st->y_acc[i01]
+				             + st->y_acc[i10] + st->y_acc[i11];
+				int      avg = (int)(sum / (4u * n));
+
+				if (st->y_dark) {
+					int d = ((int)st->y_dark[i00]
+					       + (int)st->y_dark[i01]
+					       + (int)st->y_dark[i10]
+					       + (int)st->y_dark[i11]) / 4;
+					avg -= d;
+					if (avg < 0)
+						avg = 0;
+				}
+
+				st->y_avg[oy * STACKER_OUT_WIDTH + ox] =
+					(uint8_t)avg;
+			}
+		}
+	}
+
+	/* UV plane (NV12: interleaved U,V pairs, half-height) */
+	{
+		int oyr, oxc;
+
+		for (oyr = 0; oyr < STACKER_OUT_HEIGHT / 2; oyr++) {
+			for (oxc = 0; oxc < STACKER_OUT_WIDTH / 2; oxc++) {
+				int      sr  = oyr * 2;
+				int      sc  = oxc * 2;
+				int      rb0 = sr * STACKER_WIDTH;
+				int      rb1 = (sr + 1) * STACKER_WIDTH;
+				int      cu0 = 2 * sc;
+				int      cu1 = 2 * (sc + 1);
+				uint32_t u_sum, v_sum;
+				int      u_out, v_out;
+				int      iout = oyr * STACKER_OUT_WIDTH
+				              + 2 * oxc;
+
+				u_sum = st->uv_acc[rb0 + cu0]
+				      + st->uv_acc[rb0 + cu1]
+				      + st->uv_acc[rb1 + cu0]
+				      + st->uv_acc[rb1 + cu1];
+				v_sum = st->uv_acc[rb0 + cu0 + 1]
+				      + st->uv_acc[rb0 + cu1 + 1]
+				      + st->uv_acc[rb1 + cu0 + 1]
+				      + st->uv_acc[rb1 + cu1 + 1];
+
+				u_out = (int)(u_sum / (4u * n));
+				v_out = (int)(v_sum / (4u * n));
+
+				if (st->uv_dark) {
+					int u_d =
+					    ((int)st->uv_dark[rb0 + cu0]
+					   + (int)st->uv_dark[rb0 + cu1]
+					   + (int)st->uv_dark[rb1 + cu0]
+					   + (int)st->uv_dark[rb1 + cu1]) / 4;
+					int v_d =
+					    ((int)st->uv_dark[rb0 + cu0 + 1]
+					   + (int)st->uv_dark[rb0 + cu1 + 1]
+					   + (int)st->uv_dark[rb1 + cu0 + 1]
+					   + (int)st->uv_dark[rb1 + cu1 + 1]) / 4;
+
+					u_out = (int)clamp8(u_out - u_d + 128);
+					v_out = (int)clamp8(v_out - v_d + 128);
+				}
+
+				st->uv_avg[iout]     = (uint8_t)u_out;
+				st->uv_avg[iout + 1] = (uint8_t)v_out;
+			}
+		}
+	}
 
 	/* Reset accumulators for next stack */
 	(void)memset(st->y_acc,  0, (size_t)y_sz  * sizeof(uint32_t));
 	(void)memset(st->uv_acc, 0, (size_t)uv_sz * sizeof(uint32_t));
 	st->frame_count = 0;
-
-	/* Subtract dark frame if loaded */
-	if (st->y_dark) {
-		for (i = 0; i < y_sz; i++) {
-			int v = (int)st->y_avg[i] - (int)st->y_dark[i];
-			st->y_avg[i] = (v > 0) ? (uint8_t)v : 0;
-		}
-		if (st->uv_dark) {
-			for (i = 0; i < uv_sz; i++) {
-				int v = (int)st->uv_avg[i]
-				      - (int)st->uv_dark[i] + 128;
-				st->uv_avg[i] = clamp8(v);
-			}
-		}
-	}
 
 	/* Snapshot IVS motion stats and reset counters */
 	{

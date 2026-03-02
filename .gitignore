@@ -1,3 +1,5 @@
 build-*/
 compile_commands.json
 .cache/
+server/__pycache__/
+server/~/

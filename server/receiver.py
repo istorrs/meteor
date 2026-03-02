@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import io
 import logging
 import os
 import subprocess
@@ -23,7 +24,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
 from flask import Flask, request, jsonify
+from PIL import Image, ImageFilter
 import yaml
 
 # ---------------------------------------------------------------------------
@@ -39,6 +42,8 @@ DEFAULT_CONFIG = {
     "rms_run_on_receive": False,          # set True to auto-trigger RMS per FF
     "rms_detect_script": "python3 -m RMS.DetectStarsAndMeteors",
     "log_level": "INFO",
+    "stack_enhance": True,    # background-subtract + histogram-stretch stack JPEGs
+    "stack_jpeg_quality": 92, # output JPEG quality after enhancement
 }
 
 
@@ -71,8 +76,69 @@ def night_dir_name(dt: datetime) -> str:
     return night_start.strftime("%Y%m%d_%H%M%S_000000")
 
 
+def station_from_filename(filename: str) -> str:
+    """
+    Extract station ID from an FF or STACK filename.
+    FF_XX0001_...bin  →  XX0001
+    STACK_XX0001_...jpg  →  XX0001
+    Falls back to 'unknown' if the filename doesn't match the pattern.
+    """
+    parts = filename.split("_")
+    if len(parts) >= 2 and parts[1]:
+        return parts[1]
+    return "unknown"
+
+
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Stack JPEG enhancement
+# ---------------------------------------------------------------------------
+
+def _enhance_stack(data: bytes, quality: int = 92) -> bytes:
+    """
+    Improve a stack JPEG for star visibility:
+      1. Background subtraction — large Gaussian blur models the sky-glow
+         gradient and is subtracted, leaving stars on a near-flat background.
+      2. Denoise — mild median filter removes JPEG compression artifacts
+         that would otherwise be amplified by the stretch.
+      3. Histogram stretch — 1st–99.5th percentile mapped to 0–255 so faint
+         stars use the full dynamic range.
+    """
+    img = Image.open(io.BytesIO(data)).convert("L")
+
+    # Denoise on the original uint8 image FIRST — before any float arithmetic.
+    # This removes JPEG DCT block artifacts while the pixel values are still
+    # clean integers.  radius=0.8 is intentionally gentle: the Wyze ISP already
+    # applies its own NR which creates correlated 10–20 px noise blobs; a
+    # stronger spatial filter reveals those blobs as visible texture rather than
+    # reducing them.
+    denoised = img.filter(ImageFilter.GaussianBlur(radius=0.8))
+    arr = np.array(denoised, dtype=np.float32)
+
+    # Background model: blur radius ~8% of width captures slow sky-glow
+    # gradient without touching point sources (stars are 1–3 px wide).
+    radius = max(20, img.width // 12)
+    bg = np.array(denoised.filter(ImageFilter.GaussianBlur(radius=radius)),
+                  dtype=np.float32)
+
+    # Subtract background in float, re-centre at 32 so residuals land above black.
+    sub = arr - bg + 32.0
+
+    # Percentile stretch — entirely in float32, no intermediate uint8 conversion.
+    lo = np.percentile(sub, 1.0)
+    hi = np.percentile(sub, 99.5)
+    if hi > lo:
+        stretched = np.clip((sub - lo) / (hi - lo) * 255.0, 0, 255)
+    else:
+        stretched = np.zeros_like(sub)
+
+    out = io.BytesIO()
+    Image.fromarray(stretched.astype(np.uint8)).save(out, format="JPEG",
+                                                     quality=quality)
+    return out.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +152,13 @@ def make_app(cfg: dict) -> Flask:
     stack_root    = os.path.join(cfg["rms_data_dir"], cfg["stack_subdir"])
     ensure_dir(captured_root)
     ensure_dir(stack_root)
+
+    # -----------------------------------------------------------------------
+    # GET /time — return current UTC Unix timestamp for camera clock sync
+    # -----------------------------------------------------------------------
+    @app.route("/time", methods=["GET"])
+    def get_time():
+        return jsonify({"unix": time.time()})
 
     # -----------------------------------------------------------------------
     # POST /event — receive a JSON detection event
@@ -137,7 +210,8 @@ def make_app(cfg: dict) -> Flask:
             return jsonify({"status": "error", "msg": "bad filename"}), 400
 
         now        = datetime.now(tz=timezone.utc)
-        night_dir  = os.path.join(captured_root, night_dir_name(now))
+        station    = station_from_filename(filename)
+        night_dir  = os.path.join(captured_root, station, night_dir_name(now))
         ensure_dir(night_dir)
         dest_path  = os.path.join(night_dir, filename)
 
@@ -163,11 +237,18 @@ def make_app(cfg: dict) -> Flask:
             return jsonify({"status": "error", "msg": "bad filename"}), 400
 
         now       = datetime.now(tz=timezone.utc)
-        night_dir = os.path.join(stack_root, night_dir_name(now))
+        station   = station_from_filename(filename)
+        night_dir = os.path.join(stack_root, station, night_dir_name(now))
         ensure_dir(night_dir)
         dest_path = os.path.join(night_dir, filename)
 
         data = request.get_data()
+        if cfg.get("stack_enhance", True):
+            try:
+                data = _enhance_stack(data, quality=cfg.get("stack_jpeg_quality", 92))
+            except Exception as exc:  # pylint: disable=broad-except
+                logging.warning("stack enhance failed, saving raw: %s", exc)
+
         with open(dest_path, "wb") as fh:
             fh.write(data)
 

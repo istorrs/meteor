@@ -19,11 +19,15 @@
  *   -q N      JPEG quality 1-100   (default: 85)
  *   -s N      IVS sensitivity 0-4  (default: 2)
  */
+#include <arpa/inet.h>
 #include <getopt.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -94,16 +98,165 @@ static void downsample_y(const uint8_t *src, int src_w, int src_h,
 }
 
 /* -------------------------------------------------------------------------
- * Monotonic wall-clock helper (ms)
+ * Wall-clock timestamp helper (ms since Unix epoch, CLOCK_REALTIME).
+ * Used to generate FF binary and STACK filenames — must track civil time,
+ * so CLOCK_REALTIME is required.  CLOCK_MONOTONIC would produce epoch-
+ * relative timestamps regardless of settimeofday().
  * ------------------------------------------------------------------------- */
 
-static uint64_t monotonic_ms(void)
+static uint64_t wallclock_ms(void)
 {
 	struct timespec ts;
 
-	(void)clock_gettime(CLOCK_MONOTONIC, &ts);
+	(void)clock_gettime(CLOCK_REALTIME, &ts);
 	return (uint64_t)ts.tv_sec * 1000u
 	     + (uint64_t)((uint64_t)ts.tv_nsec / 1000000u);
+}
+
+/* -------------------------------------------------------------------------
+ * Time sync — fetch UTC from the N100 /time endpoint, apply with
+ * settimeofday(2).  The camera has no battery-backed RTC, so its clock
+ * resets to the epoch on every reboot.  Without sync, FF filenames and
+ * stack timestamps land in the wrong night directory on the N100.
+ *
+ * Non-fatal: logs a warning and returns on any failure.
+ * ------------------------------------------------------------------------- */
+
+static void sync_time_from_server(const PushConfig *push)
+{
+	char               req[128]; /* flawfinder: ignore */
+	char               buf[512]; /* flawfinder: ignore */
+	struct sockaddr_in addr;
+	struct timeval     tv;
+	const char        *p;
+	long long          unix_sec;
+	int                fd;
+	ssize_t            nr;
+	size_t             total = 0;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		METEOR_LOG_WARN("time_sync: socket() failed");
+		return;
+	}
+
+	/* 3-second timeout is generous for a LAN request */
+	tv.tv_sec  = 3;
+	tv.tv_usec = 0;
+	(void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	(void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+	(void)memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port   = htons((uint16_t)push->server_port);
+	if (inet_pton(AF_INET, push->server_ip, &addr.sin_addr) != 1) {
+		METEOR_LOG_WARN("time_sync: bad server IP '%s'",
+				push->server_ip);
+		(void)close(fd);
+		return;
+	}
+
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		METEOR_LOG_WARN("time_sync: cannot connect to %s:%d",
+				push->server_ip, push->server_port);
+		(void)close(fd);
+		return;
+	}
+
+	(void)snprintf(req, sizeof(req),
+		"GET /time HTTP/1.0\r\n"
+		"Host: %s:%d\r\n"
+		"Connection: close\r\n"
+		"\r\n",
+		push->server_ip, push->server_port);
+
+	if (send(fd, req, strlen(req), 0) < 0) {
+		METEOR_LOG_WARN("time_sync: send failed");
+		(void)close(fd);
+		return;
+	}
+
+	/* Read full response — headers + {"unix": 1234567890.123} */
+	while (total < sizeof(buf) - 1u) {
+		nr = recv(fd, buf + total, sizeof(buf) - 1u - total, 0);
+		if (nr <= 0)
+			break;
+		total += (size_t)nr;
+	}
+	(void)close(fd);
+	buf[total] = '\0';
+
+	/* Locate the unix value in the JSON body */
+	p = strstr(buf, "\"unix\":");
+	if (!p) {
+		METEOR_LOG_WARN("time_sync: no \"unix\" field in response");
+		return;
+	}
+	p += 7; /* skip past "unix": */
+	while (*p == ' ' || *p == '\t')
+		p++;
+	unix_sec = strtoll(p, NULL, 10);
+	if (unix_sec <= 0) {
+		METEOR_LOG_WARN("time_sync: invalid timestamp in response");
+		return;
+	}
+
+	tv.tv_sec  = (time_t)unix_sec;
+	tv.tv_usec = 0;
+	if (settimeofday(&tv, NULL) != 0) {
+		METEOR_LOG_WARN("time_sync: settimeofday failed "
+				"(is nightcam running as root?)");
+		return;
+	}
+
+	METEOR_LOG_INFO("time_sync: clock set to %lld UTC (from %s:%d)",
+			unix_sec, push->server_ip, push->server_port);
+}
+
+/* -------------------------------------------------------------------------
+ * MAC-address-derived station ID
+ *
+ * Reads /sys/class/net/eth0/address (falls back to wlan0), takes the last
+ * two octets, and formats "XX%04u" where the numeric suffix is
+ * (b4 * 256 + b5) % 10000.  This gives each camera a stable, unique ID
+ * without requiring manual -I configuration.
+ * Falls back to DETECTOR_DEFAULT_STATION_ID if no interface is readable.
+ * ------------------------------------------------------------------------- */
+
+static void derive_station_id_from_mac(char *buf, size_t size)
+{
+	static const char * const ifaces[] = { "eth0", "wlan0", NULL };
+	char     path[64]; /* flawfinder: ignore */
+	char     mac[32];  /* flawfinder: ignore */
+	FILE    *f;
+	char    *got;
+	unsigned int b[6];
+	int      i;
+
+	for (i = 0; ifaces[i]; i++) {
+		(void)snprintf(path, sizeof(path),
+			       "/sys/class/net/%s/address", ifaces[i]);
+		f = fopen(path, "r"); /* flawfinder: ignore */
+		if (!f)
+			continue;
+		got = fgets(mac, sizeof(mac), f);
+		(void)fclose(f);
+		if (!got)
+			continue;
+		if (sscanf(mac, "%x:%x:%x:%x:%x:%x", /* flawfinder: ignore */
+			   &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+			unsigned int suffix = (b[4] * 256u + b[5]) % 10000u;
+			(void)snprintf(buf, size, "XX%04u", suffix);
+			METEOR_LOG_INFO("station ID derived from %s MAC: %s",
+					ifaces[i], buf);
+			return;
+		}
+	}
+
+	/* No readable interface — use compiled-in default */
+	(void)snprintf(buf, size, "%s", DETECTOR_DEFAULT_STATION_ID);
+	METEOR_LOG_WARN("could not read MAC address; "
+			"using default station ID %s", buf);
 }
 
 /* -------------------------------------------------------------------------
@@ -115,7 +268,7 @@ static void usage(const char *prog)
 	(void)fprintf(stderr,
 		"Usage: %s [options]\n"
 		"  -S IP    N100 server IP (default: %s)\n"
-		"  -I ID    RMS station ID (default: %s)\n"
+		"  -I ID    RMS station ID (default: derived from MAC)\n"
 		"  -t SECS  Stack interval in seconds (default: %d)\n"
 		"  -q N     JPEG quality 1-100 (default: %d)\n"
 		"  -s N     IVS sensitivity 0-4 (default: %d)\n"
@@ -124,7 +277,6 @@ static void usage(const char *prog)
 		"  -h       Show this help\n",
 		prog,
 		DETECTOR_DEFAULT_SERVER_IP,
-		DETECTOR_DEFAULT_STATION_ID,
 		DEFAULT_STACK_SECS,
 		DEFAULT_JPEG_QUALITY,
 		DEFAULT_IVS_SENSE,
@@ -145,6 +297,7 @@ int main(int argc, char **argv)
 	int       ivs_sense    = DEFAULT_IVS_SENSE;
 	int       opt, ret;
 	int       ivs_monitor_ok = 0;
+	int       station_id_set = 0;
 
 	PushConfig   push;
 	FFHeader     ff_hdr;
@@ -156,12 +309,11 @@ int main(int argc, char **argv)
 
 	uint8_t *detect_buf = NULL; /* downsampled Y plane */
 
-	(void)snprintf(server_ip,  sizeof(server_ip),
+	(void)snprintf(server_ip, sizeof(server_ip),
 		       "%s", DETECTOR_DEFAULT_SERVER_IP);
-	(void)snprintf(station_id, sizeof(station_id),
-		       "%s", DETECTOR_DEFAULT_STATION_ID);
-	(void)snprintf(dark_path,  sizeof(dark_path),
+	(void)snprintf(dark_path, sizeof(dark_path),
 		       "%s", DEFAULT_DARK_PATH);
+	station_id[0] = '\0'; /* filled by -I or derive_station_id_from_mac() */
 
 	while ((opt = getopt(argc, argv, "S:I:t:q:s:d:h")) != -1) { /* flawfinder: ignore */
 		switch (opt) {
@@ -172,6 +324,7 @@ int main(int argc, char **argv)
 		case 'I':
 			(void)snprintf(station_id, sizeof(station_id),
 				       "%s", optarg);
+			station_id_set = 1;
 			break;
 		case 't':
 			stack_secs = (int)strtol(optarg, NULL, 10);
@@ -210,6 +363,9 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (!station_id_set)
+		derive_station_id_from_mac(station_id, sizeof(station_id));
+
 	(void)signal(SIGINT,  signal_handler);
 	(void)signal(SIGTERM, signal_handler);
 
@@ -232,6 +388,11 @@ int main(int argc, char **argv)
 		       "%s", server_ip);
 	push.server_port = DETECTOR_SERVER_PORT;
 	push.timeout_ms  = DETECTOR_HTTP_TIMEOUT_MS;
+
+	/* Sync system clock from N100 before any timestamp-dependent work.
+	 * The camera has no RTC; without this FF and stack filenames land in
+	 * the wrong night directory after every reboot. */
+	sync_time_from_server(&push);
 
 	/* FF header template */
 	(void)memset(&ff_hdr, 0, sizeof(ff_hdr));
@@ -332,7 +493,7 @@ int main(int argc, char **argv)
 		}
 
 		data = (const uint8_t *)(unsigned long)frame->virAddr;
-		ts   = monotonic_ms();
+		ts   = wallclock_ms();
 
 		/* Feed FTP detector (downsampled Y plane) */
 		downsample_y(data,

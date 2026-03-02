@@ -7,8 +7,10 @@
  * These prioritize detecting brief, faint streaks against a dark sky.
  */
 #define DEFAULT_TEMPER_STRENGTH    0    /* off — preserve single-frame events */
-#define DEFAULT_SINTER_STRENGTH   48   /* low — reduce noise, keep faint streaks */
-#define DEFAULT_DRC_STRENGTH      192  /* high — pull detail from dark background */
+#define DEFAULT_SINTER_STRENGTH    0   /* off — let stacker average out raw noise;
+                                        * correlated sinter blobs defeat √N averaging */
+#define DEFAULT_DRC_STRENGTH      64   /* reduced — less shadow boost = less noise
+                                        * amplification in dark sky regions */
 
 int meteor_isp_tuning_init(void)
 {
