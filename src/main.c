@@ -2,13 +2,17 @@
 #include <meteor/capture.h>
 #include <meteor/config.h>
 #include <meteor/event.h>
+#include <meteor/event_push.h>
 #include <meteor/framesource.h>
 #include <meteor/isp.h>
 #include <meteor/isp_tuning.h>
 #include <meteor/ivs.h>
 #include <meteor/log.h>
+#include <meteor/meteor_config.h>
 #include <meteor/system.h>
 #include <signal.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -54,6 +58,7 @@ int main(int argc, char **argv) {
   meteor_event_ctx evt;
   meteor_ivs_result ivs_result;
   struct sigaction sa;
+  PushConfig push;
   int ret;
 
   if (meteor_config_parse(&cfg, argc, argv))
@@ -68,6 +73,12 @@ int main(int argc, char **argv) {
   sa.sa_flags = SA_NOCLDWAIT;
   (void)sigaction(SIGCHLD, &sa, NULL);
 
+  /* PushConfig for N100 receiver */
+  (void)memset(&push, 0, sizeof(push));
+  (void)snprintf(push.server_ip, sizeof(push.server_ip), "%s", cfg.server_ip);
+  push.server_port = DETECTOR_SERVER_PORT;
+  push.timeout_ms = DETECTOR_HTTP_TIMEOUT_MS;
+
   meteor_log_init();
   METEOR_LOG_INFO("meteor starting");
   METEOR_LOG_INFO(
@@ -76,6 +87,7 @@ int main(int argc, char **argv) {
       cfg.capture_interval_ms, cfg.output_dir);
   METEOR_LOG_INFO("storage: max_frames=%d retention=%dd", cfg.max_event_frames,
                   cfg.retention_days);
+  METEOR_LOG_INFO("push target: %s:%d", push.server_ip, push.server_port);
 
   if (ensure_output_dir(cfg.output_dir))
     return 1;
@@ -144,8 +156,21 @@ int main(int argc, char **argv) {
 
     if (meteor_event_should_capture(&evt)) {
       if (meteor_capture_frame(FS_CHN, evt.event_dir, evt.frame_count, WIDTH,
-                               HEIGHT, cfg.color) == 0)
+                               HEIGHT, cfg.color) == 0) {
+        /* Push captured frame to N100 */
+        {
+          char push_path[320]; /* flawfinder: ignore */
+          char push_name[64];  /* flawfinder: ignore */
+
+          (void)snprintf(push_path, sizeof(push_path), "%s/frame_%03d.jpg",
+                         evt.event_dir, evt.frame_count);
+          (void)snprintf(push_name, sizeof(push_name), "frame_%03d.jpg",
+                         evt.frame_count);
+          if (event_push_stack(&push, push_path, push_name) < 0)
+            METEOR_LOG_WARN("push /stack failed for %s", push_name);
+        }
         meteor_event_frame_captured(&evt);
+      }
     }
   }
 

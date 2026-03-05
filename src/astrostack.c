@@ -38,7 +38,9 @@
 #include <imp/imp_framesource.h>
 #include <imp/imp_isp.h>
 #include <imp/imp_system.h>
+#include <meteor/event_push.h>
 #include <meteor/jpeg.h>
+#include <meteor/meteor_config.h>
 
 /* --- logging ------------------------------------------------------------ */
 
@@ -776,6 +778,52 @@ cleanup:
 
 /* --- main --------------------------------------------------------------- */
 
+static void derive_station_id_from_mac(char *buf, size_t size) {
+  static const char *const ifaces[] = {"eth0", "wlan0", NULL};
+  char path[64]; /* flawfinder: ignore */
+  char mac[32];  /* flawfinder: ignore */
+  FILE *f;
+  char *got;
+  unsigned long b[6];
+  int i;
+
+  for (i = 0; ifaces[i]; i++) {
+    int octet;
+    char *p;
+    char *end;
+    int ok = 1;
+
+    (void)snprintf(path, sizeof(path), "/sys/class/net/%s/address", ifaces[i]);
+    f = fopen(path, "r"); /* flawfinder: ignore */
+    if (!f)
+      continue;
+    got = fgets(mac, sizeof(mac), f);
+    (void)fclose(f);
+    if (!got)
+      continue;
+
+    p = mac;
+    for (octet = 0; octet < 6 && ok; octet++) {
+      b[octet] = strtoul(p, &end, 16);
+      if (end == p || b[octet] > 0xFF)
+        ok = 0;
+      else if (octet < 5)
+        p = (*end == ':') ? end + 1 : (ok = 0, p);
+    }
+
+    if (ok) {
+      unsigned int suffix =
+          ((unsigned int)b[4] * 256u + (unsigned int)b[5]) % 10000u;
+      (void)snprintf(buf, size, "XX%04u", suffix);
+      LOG_INFO("station ID derived from %s MAC: %s", ifaces[i], buf);
+      return;
+    }
+  }
+
+  (void)snprintf(buf, size, "%s", DETECTOR_DEFAULT_STATION_ID);
+  LOG_WARN("could not read MAC address; using default station ID %s", buf);
+}
+
 static void usage(const char *prog) {
   (void)fprintf(
       stderr,
@@ -790,9 +838,10 @@ static void usage(const char *prog) {
       "  -c        Enable outlier rejection (min/max clipping)\n"
       "  -m THRESH Composite bright transients (meteors) onto stack\n"
       "  -D FILE   Subtract dark frame JPEG\n"
+      "  -S IP     Push stacked images to N100 at IP (default: %s)\n"
       "  -h        Show this help\n",
       prog, DEFAULT_FRAMES, DEFAULT_EXPOSURE, DEFAULT_OUTPUT,
-      DEFAULT_OUTPUT_DIR, DEFAULT_QUALITY);
+      DEFAULT_OUTPUT_DIR, DEFAULT_QUALITY, DETECTOR_DEFAULT_SERVER_IP);
 }
 
 int main(int argc, char **argv) {
@@ -809,9 +858,16 @@ int main(int argc, char **argv) {
   int opt, ret;
   char *endptr;
   char path_buf[PATH_MAX]; /* flawfinder: ignore */
+  char server_ip[64];      /* flawfinder: ignore */
+  char station_id[20];     /* flawfinder: ignore */
+  PushConfig push;
+
+  (void)snprintf(server_ip, sizeof(server_ip), "%s",
+                 DETECTOR_DEFAULT_SERVER_IP);
+  derive_station_id_from_mac(station_id, sizeof(station_id));
 
   /* flawfinder: ignore */
-  while ((opt = getopt(argc, argv, "n:e:o:d:t:q:m:gcD:h")) != -1) {
+  while ((opt = getopt(argc, argv, "n:e:o:d:t:q:m:gcD:S:h")) != -1) {
     switch (opt) {
     case 'n':
       num_frames = (int)strtol(optarg, &endptr, 10);
@@ -865,6 +921,9 @@ int main(int argc, char **argv) {
     case 'D':
       dark_path_arg = optarg;
       break;
+    case 'S':
+      (void)snprintf(server_ip, sizeof(server_ip), "%s", optarg);
+      break;
     case 'h':
       usage(argv[0]);
       return 0;
@@ -879,6 +938,14 @@ int main(int argc, char **argv) {
 
   (void)setvbuf(stdout, NULL, _IOLBF, 0);
   (void)setvbuf(stderr, NULL, _IOLBF, 0);
+
+  /* PushConfig for N100 receiver */
+  (void)memset(&push, 0, sizeof(push));
+  (void)snprintf(push.server_ip, sizeof(push.server_ip), "%s", server_ip);
+  push.server_port = DETECTOR_SERVER_PORT;
+  push.timeout_ms = DETECTOR_HTTP_TIMEOUT_MS;
+
+  LOG_INFO("push target: %s:%d", push.server_ip, push.server_port);
 
   if (ensure_output_dir(output_dir)) {
     return 1;
@@ -968,7 +1035,23 @@ int main(int argc, char **argv) {
 
         ret = stack_frames(num_frames, grayscale, clip, meteor_thresh, y_dark,
                            uv_dark, path_buf, quality);
-        if (ret || !running)
+        if (ret)
+          break;
+
+        /* Push stacked image to N100 */
+        {
+          const char *basename = strrchr(path_buf, '/');
+          char remote_file[PATH_MAX + 100]; /* flawfinder: ignore */
+          basename = basename ? basename + 1 : path_buf;
+          (void)snprintf(remote_file, sizeof(remote_file), "STACK_%s_%s",
+                         station_id, basename);
+          if (event_push_stack(&push, path_buf, remote_file) < 0)
+            LOG_WARN("push /stack failed for %s", remote_file);
+          else
+            LOG_INFO("pushed %s to %s", remote_file, server_ip);
+        }
+
+        if (!running)
           break;
 
         frame_idx++;
@@ -981,6 +1064,19 @@ int main(int argc, char **argv) {
       } else {
         ret = stack_frames(num_frames, grayscale, clip, meteor_thresh, y_dark,
                            uv_dark, path_buf, quality);
+
+        /* Push stacked image to N100 */
+        if (ret == 0) {
+          const char *basename = strrchr(path_buf, '/');
+          char remote_file[PATH_MAX + 100]; /* flawfinder: ignore */
+          basename = basename ? basename + 1 : path_buf;
+          (void)snprintf(remote_file, sizeof(remote_file), "STACK_%s_%s",
+                         station_id, basename);
+          if (event_push_stack(&push, path_buf, remote_file) < 0)
+            LOG_WARN("push /stack failed for %s", remote_file);
+          else
+            LOG_INFO("pushed %s to %s", remote_file, server_ip);
+        }
       }
     }
 

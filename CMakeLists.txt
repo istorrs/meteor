@@ -53,6 +53,7 @@ set(METEOR_SOURCES
     src/jpeg.c
     src/event.c
     src/capture.c
+    src/event_push.c
 )
 
 add_executable(meteor ${METEOR_SOURCES})
@@ -121,7 +122,7 @@ target_link_libraries(nightcam
 )
 
 # Build astrostack executable (standalone astrophotography stacker)
-add_executable(astrostack src/astrostack.c src/jpeg.c src/log.c)
+add_executable(astrostack src/astrostack.c src/jpeg.c src/log.c src/event_push.c)
 
 target_link_libraries(astrostack
     imp
