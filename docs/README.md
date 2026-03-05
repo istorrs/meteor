@@ -132,6 +132,7 @@ libimp.so:
 ```
 
 The thingino toolchain uses **musl**, where:
+
 - `libpthread` is built into `libc.so` (no separate `libpthread.so.0`)
 - `libdl` is built into `libc.so` (no separate `libdl.so.0`)
 - The libc soname is `libc.so`, not `libc.so.0`
@@ -280,7 +281,15 @@ ssh root@<camera-ip>
 /tmp/nightsky.sh /tmp/astrostack -n 30 -e 5 -c -o /tmp/stack.ppm
 ```
 
+### ISP Tuning Differences
+
+The two tools configure the Image Signal Processor (ISP) differently based on their goals:
+
+- **`meteor`**: Uses aggressive Dynamic Range Compression (DRC) and High/Low Frequency sharpening to maximize contrast for faint motion detection.
+- **`astrostack`**: Disables DRC, minimizes artificial sharpening, and fixes analog gain/exposure time to produce cleaner, linear-response frames suitable for stacking and post-processing.
+
 The wrapper script:
+
 1. Stops the `daynightd` daemon (prevents IR/filter state changes)
 2. Turns off IR illumination LEDs (eliminates glare)
 3. Removes the IR cut filter (allows full spectrum sensitivity)

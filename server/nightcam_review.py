@@ -191,14 +191,20 @@ class TimelapseWorker(threading.Thread):
 				for f in jpeg_files:
 					fh.write(f"file '{f}'\n")
 					fh.write(f"duration {frame_dur:.6f}\n")
+				# The concat demuxer requires a trailing file entry
+				# WITHOUT a duration line so the last frame is shown;
+				# without it the last frame gets zero duration and
+				# ffmpeg may error out or drop it.
+				if jpeg_files:
+					fh.write(f"file '{jpeg_files[-1]}'\n")
 
 			output_path = os.path.join(
-				self.night_dir, f"timelapse_{self.night_name}.mp4"
+				self.night_dir,
+				f"timelapse_{self.night_name.replace('/', '_')}.mp4"
 			)
 			cmd = [
 				"ffmpeg", "-y", "-f", "concat", "-safe", "0",
 				"-i", filelist_path,
-				"-vf", f"fps={self.fps}",
 				"-c:v", "libx264", "-preset", "fast",
 				"-crf", "23", "-pix_fmt", "yuv420p",
 				output_path,
@@ -209,7 +215,9 @@ class TimelapseWorker(threading.Thread):
 				stderr=subprocess.PIPE,
 				text=True,
 			)
+			stderr_lines = []
 			for line in proc.stderr:
+				stderr_lines.append(line.rstrip())
 				if self._cancelled.is_set():
 					proc.terminate()
 					self.root.after(0, lambda: self.on_done(None, "Cancelled"))
@@ -222,6 +230,10 @@ class TimelapseWorker(threading.Thread):
 			if proc.returncode == 0:
 				self.root.after(0, lambda: self.on_done(output_path, None))
 			else:
+				print("=== ffmpeg stderr ===", flush=True)
+				for sl in stderr_lines:
+					print(sl, flush=True)
+				print("=== end ffmpeg stderr ===", flush=True)
 				self.root.after(0,
 				                lambda: self.on_done(
 				                    None,
