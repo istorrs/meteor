@@ -218,13 +218,19 @@ static void isp_exit(void) {
   IMP_ISP_Close();
 }
 
-static int isp_configure_for_stacking(int exposure_secs) {
+static int isp_configure_for_stacking(int exposure_secs, int grayscale) {
   int ret;
 
-  /* Night mode — always */
-  ret = IMP_ISP_Tuning_SetISPRunningMode(IMPISP_RUNNING_MODE_NIGHT);
-  if (ret)
-    LOG_WARN("SetISPRunningMode(NIGHT) failed: %d", ret);
+  /* Night mode natively drops chroma. Only enable if we want grayscale */
+  if (grayscale) {
+    ret = IMP_ISP_Tuning_SetISPRunningMode(IMPISP_RUNNING_MODE_NIGHT);
+    if (ret)
+      LOG_WARN("SetISPRunningMode(NIGHT) failed: %d", ret);
+  } else {
+    ret = IMP_ISP_Tuning_SetISPRunningMode(IMPISP_RUNNING_MODE_DAY);
+    if (ret)
+      LOG_WARN("SetISPRunningMode(DAY) failed: %d", ret);
+  }
 
   /* Disable temporal denoising — we are the denoiser */
   ret = IMP_ISP_Tuning_SetTemperStrength(0);
@@ -964,7 +970,7 @@ int main(int argc, char **argv) {
     goto err_sys;
 
   /* 3. ISP tuning for stacking */
-  ret = isp_configure_for_stacking(exposure);
+  ret = isp_configure_for_stacking(exposure, grayscale);
   if (ret)
     goto err_isp;
 

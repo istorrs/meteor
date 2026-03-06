@@ -39,11 +39,13 @@ DEFAULT_CONFIG = {
     "rms_data_dir": os.path.expanduser("~/RMS_data"),
     "captured_subdir": "CapturedFiles",
     "stack_subdir": "Stacks",
+    "raw_stack_subdir": "Stacks_raw",
     "rms_run_on_receive": False,          # set True to auto-trigger RMS per FF
     "rms_detect_script": "python3 -m RMS.DetectStarsAndMeteors",
     "log_level": "INFO",
-    "stack_enhance": True,    # background-subtract + histogram-stretch stack JPEGs
+    "stack_enhance": False,   # background-subtract + histogram-stretch stack JPEGs
     "stack_jpeg_quality": 92, # output JPEG quality after enhancement
+    "save_raw_stack": True,   # save a copy of the unedited STACK JPEG
 }
 
 
@@ -150,8 +152,11 @@ def make_app(cfg: dict) -> Flask:
 
     captured_root = os.path.join(cfg["rms_data_dir"], cfg["captured_subdir"])
     stack_root    = os.path.join(cfg["rms_data_dir"], cfg["stack_subdir"])
+    raw_stack_root = os.path.join(cfg["rms_data_dir"], cfg.get("raw_stack_subdir", "Stacks_raw"))
     ensure_dir(captured_root)
     ensure_dir(stack_root)
+    if cfg.get("save_raw_stack", True):
+        ensure_dir(raw_stack_root)
 
     # -----------------------------------------------------------------------
     # GET /time — return current UTC Unix timestamp for camera clock sync
@@ -243,6 +248,15 @@ def make_app(cfg: dict) -> Flask:
         dest_path = os.path.join(night_dir, filename)
 
         data = request.get_data()
+
+        if cfg.get("save_raw_stack", True):
+            raw_night_dir = os.path.join(raw_stack_root, station, night_dir_name(now))
+            ensure_dir(raw_night_dir)
+            raw_dest_path = os.path.join(raw_night_dir, filename)
+            with open(raw_dest_path, "wb") as fh:
+                fh.write(data)
+            logging.info("RAW STACK saved: %s (%d bytes)", raw_dest_path, len(data))
+
         if cfg.get("stack_enhance", True):
             try:
                 data = _enhance_stack(data, quality=cfg.get("stack_jpeg_quality", 92))
