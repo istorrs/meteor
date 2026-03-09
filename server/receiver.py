@@ -11,23 +11,26 @@ Endpoints:
   POST /stack  — save a timelapse stack JPEG into a dated directory
 
 Usage:
-  pip install flask pyyaml
+  pip install flask pyyaml requests geopy
   python3 receiver.py [--config config.yaml]
 """
 
 import argparse
 import io
+import json
 import logging
 import os
 import subprocess
+import threading
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import numpy as np
-from flask import Flask, request, jsonify
-from PIL import Image, ImageFilter
+import requests
 import yaml
+from flask import Flask, jsonify, request
+from geopy.geocoders import Nominatim
+from PIL import Image, ImageFilter
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -46,10 +49,13 @@ DEFAULT_CONFIG = {
     "stack_enhance": False,   # background-subtract + histogram-stretch stack JPEGs
     "stack_jpeg_quality": 92, # output JPEG quality after enhancement
     "save_raw_stack": True,   # save a copy of the unedited STACK JPEG
+    "address": None,          # optional address to lookup flights relative to
+    "opensky_radius_km": 16,  # search radius (~10 miles)
 }
 
 
 def load_config(path: str) -> dict:
+    """Load config"""
     cfg = dict(DEFAULT_CONFIG)
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as fh:
@@ -92,6 +98,7 @@ def station_from_filename(filename: str) -> str:
 
 
 def ensure_dir(path: str) -> None:
+    """Ensure dir"""
     os.makedirs(path, exist_ok=True)
 
 
@@ -148,6 +155,8 @@ def _enhance_stack(data: bytes, quality: int = 92) -> bytes:
 # ---------------------------------------------------------------------------
 
 def make_app(cfg: dict) -> Flask:
+    """Make app"""
+    # pylint: disable=too-many-statements
     app = Flask(__name__)
 
     captured_root = os.path.join(cfg["rms_data_dir"], cfg["captured_subdir"])
@@ -172,7 +181,7 @@ def make_app(cfg: dict) -> Flask:
     def recv_event():
         try:
             evt = request.get_json(force=True, silent=True) or {}
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
             evt = {}
 
         ts_ms    = evt.get("timestamp_ms", int(time.time() * 1000))
@@ -205,6 +214,93 @@ def make_app(cfg: dict) -> Flask:
         return jsonify({"status": "ok"}), 200
 
     # -----------------------------------------------------------------------
+    # OpenSky Network Lookup (Background Worker)
+    # -----------------------------------------------------------------------
+    def _query_opensky_bg(ff_path: str, cfg: dict):
+        """Query opensky"""
+        # pylint: disable=too-many-locals,broad-exception-caught
+        address = cfg.get("address")
+        if not address:
+            return
+
+        try:
+            geolocator = Nominatim(user_agent="meteor_station_receiver")
+            location = geolocator.geocode(address)
+            if not location:
+                logging.error("opensky: could not geocode configured address: %s", address)
+                return
+            lat = location.latitude
+            lon = location.longitude
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logging.error("opensky: geocoding error: %s", exc)
+            return
+
+        # Parse FF filename: FF_<station>_YYYYMMDD_HHMMSS_mmm_000000.bin
+        base = os.path.splitext(os.path.basename(ff_path))[0]
+        parts = base.split("_")
+        if len(parts) < 5 or parts[0] != "FF":
+            return
+
+        try:
+            dt_str = parts[2] + parts[3]  # YYYYMMDDHHMMSS
+            dt = datetime.strptime(dt_str, "%Y%m%d%H%M%S")
+            dt = dt.replace(tzinfo=timezone.utc)
+            unix_ts = int(dt.timestamp())
+        except ValueError:
+            logging.error("opensky: failed to parse timestamp from %s", base)
+            return
+
+        # Earth radius roughly 6371 km. 1 deg lat ~= 111 km.
+        radius_km = cfg.get("opensky_radius_km", 16)
+        lat_delta = radius_km / 111.0
+        lon_delta = radius_km / (111.0 * np.cos(np.radians(lat)))
+
+        lamin = lat - lat_delta
+        lamax = lat + lat_delta
+        lomin = lon - lon_delta
+        lomax = lon + lon_delta
+
+        url = (
+            f"https://opensky-network.org/api/states/all?"
+            f"time={unix_ts}&lamin={lamin}&lomin={lomin}&lamax={lamax}&lomax={lomax}"
+        )
+
+        try:
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+
+            states = data.get("states")
+            flights = []
+            if states:
+                for s in states:
+                    flights.append({
+                        "callsign": str(s[1]).strip() if s[1] else "UNKNOWN",
+                        "origin_country": s[2],
+                        "longitude": s[5],
+                        "latitude": s[6],
+                        "altitude_m": s[7],
+                        "velocity_ms": s[9],
+                        "heading_deg": s[10],
+                    })
+
+            out_path = os.path.splitext(ff_path)[0] + "_flights.json"
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "timestamp": unix_ts,
+                    "target_lat": lat,
+                    "target_lon": lon,
+                    "radius_km": radius_km,
+                    "flights_found": len(flights),
+                    "flights": flights
+                }, f, indent=2)
+
+            logging.info("opensky: saved %d flights for %s", len(flights), base)
+
+        except requests.exceptions.RequestException as e:
+            logging.warning("opensky: query failed for %s: %s", base, e)
+
+    # -----------------------------------------------------------------------
     # POST /ff — receive an FF binary file
     # -----------------------------------------------------------------------
     @app.route("/ff", methods=["POST"])
@@ -228,6 +324,9 @@ def make_app(cfg: dict) -> Flask:
 
         if cfg.get("rms_run_on_receive"):
             _trigger_rms(cfg, night_dir)
+
+        if cfg.get("address") is not None:
+            threading.Thread(target=_query_opensky_bg, args=(dest_path, cfg), daemon=True).start()
 
         return jsonify({"status": "ok", "path": dest_path}), 200
 
@@ -260,7 +359,7 @@ def make_app(cfg: dict) -> Flask:
         if cfg.get("stack_enhance", True):
             try:
                 data = _enhance_stack(data, quality=cfg.get("stack_jpeg_quality", 92))
-            except Exception as exc:  # pylint: disable=broad-except
+            except Exception as exc:  # pylint: disable=broad-except,broad-exception-caught
                 logging.warning("stack enhance failed, saving raw: %s", exc)
 
         with open(dest_path, "wb") as fh:
@@ -280,7 +379,8 @@ def _trigger_rms(cfg: dict, night_dir: str) -> None:
     cmd = f"{cfg['rms_detect_script']} {night_dir}"
     logging.info("Triggering RMS: %s", cmd)
     try:
-        subprocess.Popen(cmd, shell=True)  # noqa: S602  (trusted internal LAN command)
+        with subprocess.Popen(cmd, shell=True) as _:  # noqa: S602
+            pass
     except OSError as exc:
         logging.warning("RMS trigger failed: %s", exc)
 
@@ -290,6 +390,7 @@ def _trigger_rms(cfg: dict, night_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    """Main"""
     parser = argparse.ArgumentParser(description="Meteor FF receiver")
     parser.add_argument("--config", default="config.yaml",
                         help="path to config.yaml (default: config.yaml)")
